@@ -129,7 +129,7 @@ mod hardware {
     use serde_json::{Value, json};
 
     impl Pads {
-        pub(super) fn read(&mut self) -> PadState {
+        pub(super) fn read(&mut self, _focused: bool) -> PadState {
             PadState::default()
         }
         pub(in crate::game) fn release_hardware(&mut self) {}
@@ -279,7 +279,10 @@ impl Game<'_> {
         }
         let hardware = match self.pad.feed {
             Some(state) => state,
-            None => self.pad.read(),
+            None => {
+                let focused = self.focused;
+                self.pad.read(focused)
+            }
         };
         // A Nintendo pad going by its letters is read that way: its own, or the one
         // splitscreen's router feeds this player.

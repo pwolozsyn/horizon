@@ -8,6 +8,7 @@ use super::{
 use horizon_client::controller_ui::Device;
 use horizon_client::gamepad::{self, Button, GlyphStyle, PadState, Rumble, TriggerFeel};
 use serde_json::{Value, json};
+use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 mod face_buttons;
@@ -40,6 +41,85 @@ pub(super) struct Devices {
     routed: Option<Vec<Value>>,
     /// While `PadRouter` has the reader and isn't lending it: vibrations it hasn't played yet.
     routed_rumbles: Vec<gamepad::Pulse>,
+    /// Pads taken for this window, one per game on the machine (`HORIZON_PAD_CLAIMS`).
+    claims: Option<Claims>,
+}
+
+/// Work out which game a pad belongs to (`HORIZON_PAD_CLAIMS`): a claim file per pad in a
+/// directory the games share, so the first to press a button on it drives it.
+struct Claims {
+    /// The shared directory the claim files live in.
+    dir: PathBuf,
+    /// The pad this window took; from then on only its input counts.
+    owned: Option<gilrs::GamepadId>,
+    /// Its claim file, removed when the pad goes or the game quits.
+    file: Option<PathBuf>,
+}
+
+impl Drop for Claims {
+    fn drop(&mut self) {
+        if let Some(file) = &self.file {
+            let _ = std::fs::remove_file(file);
+        }
+    }
+}
+
+/// The name of a pad's claim file: its index and uuid, the same in every process on Windows.
+fn claim_key_of(index: usize, uuid: [u8; 16]) -> String {
+    let uuid: String = uuid.iter().map(|b| format!("{b:02x}")).collect();
+    format!("pad-{index}-{uuid}")
+}
+
+fn claim_key(id: gilrs::GamepadId, uuid: [u8; 16]) -> String {
+    claim_key_of(usize::from(id), uuid)
+}
+
+/// Whether `id` may drive this window. Without claims, any pad may, as before. With them, only
+/// the pad this window owns; a button pressed on one while the window has focus takes it.
+fn take_over(
+    claims: &mut Option<Claims>,
+    id: gilrs::GamepadId,
+    pressed: bool,
+    focused: bool,
+    name: &str,
+    uuid: [u8; 16],
+) -> bool {
+    let Some(claims) = claims else {
+        return true;
+    };
+    if claims.owned == Some(id) {
+        return true;
+    }
+    if claims.owned.is_some() || !focused || !pressed {
+        return false;
+    }
+    let key = claim_key(id, uuid);
+    let path = claims.dir.join(&key);
+    let mut file = match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&path)
+    {
+        Ok(file) => file,
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            log::info!("Pad {name} ({key}) is another window's");
+            return false;
+        }
+        Err(e) => {
+            log::warn!("Horizon: pad claim for {name} ({key}): {e}");
+            return false;
+        }
+    };
+    use std::io::Write;
+    if let Err(e) = file.write_all(std::process::id().to_string().as_bytes()) {
+        log::warn!("Horizon: pad claim for {name} ({key}): {e}");
+        let _ = std::fs::remove_file(&path);
+        return false;
+    }
+    log::info!("Pad claimed: {name} ({key})");
+    claims.owned = Some(id);
+    claims.file = Some(path);
+    true
 }
 
 /// `pad status`'s line for a controller. `uuid` is the id an SDL mapping row starts with, so a
@@ -181,6 +261,26 @@ impl Pads {
             return;
         }
         self.devices.started = true;
+        // Once: a reader reopened after splitscreen keeps the pad it already took.
+        if self.devices.claims.is_none()
+            && let Some(dir) = std::env::var_os("HORIZON_PAD_CLAIMS").filter(|d| !d.is_empty())
+        {
+            let dir = PathBuf::from(dir);
+            match std::fs::create_dir_all(&dir) {
+                Ok(()) => {
+                    log::info!(
+                        "Pad claims in {}: this window takes the first pad pressed while it has focus",
+                        dir.display()
+                    );
+                    self.devices.claims = Some(Claims {
+                        dir,
+                        owned: None,
+                        file: None,
+                    });
+                }
+                Err(e) => log::warn!("Horizon: pad claims in {}: {e}", dir.display()),
+            }
+        }
         self.devices.gilrs = match gilrs_builder().build() {
             Ok(g) => {
                 for (id, pad) in g.gamepads() {
@@ -215,8 +315,9 @@ impl Pads {
         }
     }
 
-    /// Drain gilrs' events and read the active pad (opening gilrs the first time).
-    pub(super) fn read(&mut self) -> PadState {
+    /// Drain gilrs' events and read the active pad (opening gilrs the first time). `focused`: this
+    /// window has focus, so a pad pressed on it may be taken (`HORIZON_PAD_CLAIMS`).
+    pub(super) fn read(&mut self, focused: bool) -> PadState {
         self.start();
         let Some(gilrs) = self.devices.gilrs.as_mut() else {
             return PadState::default();
@@ -247,17 +348,46 @@ impl Pads {
                     if self.devices.active == Some(id) {
                         self.devices.active = None;
                     }
+                    // Its claim goes with it, so it can be taken again when it comes back.
+                    if let Some(claims) = &mut self.devices.claims
+                        && claims.owned == Some(id)
+                    {
+                        if let Some(file) = claims.file.take() {
+                            let _ = std::fs::remove_file(&file);
+                        }
+                        claims.owned = None;
+                    }
                     if let Some(output) = &self.devices.output {
                         output.scan();
                     }
                 }
-                E::ButtonPressed(..) => self.devices.active = Some(id),
+                E::ButtonPressed(..) => {
+                    let pad = gilrs.gamepad(id);
+                    let uuid = pad.uuid();
+                    let name = pad.name().to_owned();
+                    if take_over(&mut self.devices.claims, id, true, focused, &name, uuid) {
+                        self.devices.active = Some(id);
+                    }
+                }
                 E::AxisChanged(axis, value, _)
                     if axis_takes_over(axis, value, z_is_a_stick(&gilrs.gamepad(id))) =>
                 {
-                    self.devices.active = Some(id)
+                    // Only a button press claims a pad; a stick just drives one already owned.
+                    let pad = gilrs.gamepad(id);
+                    let uuid = pad.uuid();
+                    let name = pad.name().to_owned();
+                    if take_over(&mut self.devices.claims, id, false, focused, &name, uuid) {
+                        self.devices.active = Some(id);
+                    }
                 }
-                E::ButtonChanged(_, value, _) if value > TAKEOVER => self.devices.active = Some(id),
+                E::ButtonChanged(_, value, _) if value > TAKEOVER => {
+                    let pad = gilrs.gamepad(id);
+                    let uuid = pad.uuid();
+                    let name = pad.name().to_owned();
+                    if take_over(&mut self.devices.claims, id, false, focused, &name, uuid) {
+                        self.devices.active = Some(id);
+                    }
+                }
                 _ => {}
             }
         }
@@ -838,5 +968,16 @@ mod takeover_tests {
             !axis_takes_over(A::Unknown, -0.99, true),
             "its triggers rest here"
         );
+    }
+}
+
+#[cfg(test)]
+mod claim_tests {
+    use super::*;
+
+    #[test]
+    fn a_claim_file_is_named_by_the_pads_index_and_uuid() {
+        let uuid = [0xab; 16];
+        assert_eq!(claim_key_of(3, uuid), format!("pad-3-{}", "ab".repeat(16)));
     }
 }
