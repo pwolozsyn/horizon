@@ -48,12 +48,15 @@ pub(super) struct Devices {
 /// Work out which game a pad belongs to (`HORIZON_PAD_CLAIMS`): a claim file per pad in a
 /// directory the games share, so the first to press a button on it drives it.
 struct Claims {
-    /// The shared directory the claim files live in.
+    /// The shared directory the claim files live in (empty when only an index is fixed).
     dir: PathBuf,
     /// The pad this window took; from then on only its input counts.
     owned: Option<gilrs::GamepadId>,
     /// Its claim file, removed when the pad goes or the game quits.
     file: Option<PathBuf>,
+    /// `HORIZON_PAD_INDEX`: this window's pad by number, whatever it presses and whether or not
+    /// the window has focus.
+    fixed: Option<usize>,
 }
 
 impl Drop for Claims {
@@ -87,6 +90,10 @@ fn take_over(
     let Some(claims) = claims else {
         return true;
     };
+    // A fixed pad (`HORIZON_PAD_INDEX`) is this window's by number: no focus, no press, no file.
+    if let Some(index) = claims.fixed {
+        return usize::from(id) == index;
+    }
     if claims.owned == Some(id) {
         return true;
     }
@@ -253,6 +260,122 @@ fn gilrs_builder() -> gilrs::GilrsBuilder {
     gilrs::GilrsBuilder::new().add_mappings(EXTRA_SDL_MAPPINGS)
 }
 
+/// Whether `flag` is among the arguments.
+fn has_flag(args: &[String], flag: &str) -> bool {
+    args.iter().any(|arg| arg == flag)
+}
+
+/// The argument right after `flag`, if there is one.
+fn value_after<'a>(args: &'a [String], flag: &str) -> Option<&'a str> {
+    args.iter()
+        .position(|arg| arg == flag)
+        .and_then(|i| args.get(i + 1))
+        .map(String::as_str)
+}
+
+/// The pads `--pad-ignore` leaves out: its comma-separated indices, skipping anything that
+/// isn't one.
+fn parse_ignore(list: &str) -> Vec<usize> {
+    list.split(',').filter_map(|n| n.trim().parse().ok()).collect()
+}
+
+/// The glyph family a pad belongs to, as the pad picker names it.
+fn glyph_family(style: GlyphStyle) -> &'static str {
+    match style {
+        GlyphStyle::PlayStation => "playstation",
+        GlyphStyle::Nintendo => "nintendo",
+        _ => "xbox",
+    }
+}
+
+/// A pad's uuid, in the hex the claim files use.
+fn uuid_hex(uuid: [u8; 16]) -> String {
+    uuid.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+fn flush_stdout() {
+    use std::io::Write;
+    let _ = std::io::stdout().flush();
+}
+
+/// The launch script's pad picker: `--pad-list` prints the pads, `--pad-wait [seconds]` waits for
+/// a button press (`--pad-ignore 0,2` leaves some pads out). The game isn't started. `None` when
+/// neither flag is given.
+pub(crate) fn pad_tool(args: &[String]) -> Option<i32> {
+    let list = has_flag(args, "--pad-list");
+    if !list && !has_flag(args, "--pad-wait") {
+        return None;
+    }
+    let mut gilrs = match gilrs_builder().build() {
+        Ok(gilrs) => gilrs,
+        Err(e) => {
+            println!("{}", json!({ "error": e.to_string() }));
+            flush_stdout();
+            return Some(1);
+        }
+    };
+    // The backend reports the pads it finds shortly after it opens; let it.
+    let opened = Instant::now();
+    while opened.elapsed() < Duration::from_millis(700) {
+        while gilrs.next_event().is_some() {}
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let code = if list {
+        let pads: Vec<Value> = gilrs
+            .gamepads()
+            .map(|(id, pad)| {
+                let vendor = pad.vendor_id();
+                let product = pad.product_id();
+                json!({
+                    "index": usize::from(id),
+                    "name": pad.name(),
+                    "uuid": uuid_hex(pad.uuid()),
+                    "vendor": vendor.map_or(String::new(), |v| format!("{v:04x}")),
+                    "product": product.map_or(String::new(), |p| format!("{p:04x}")),
+                    "family": glyph_family(GlyphStyle::of_device(vendor, product)),
+                })
+            })
+            .collect();
+        println!("{}", json!({ "pads": pads }));
+        0
+    } else {
+        let seconds = value_after(args, "--pad-wait")
+            .and_then(|n| n.parse().ok())
+            .unwrap_or(30);
+        let ignore = value_after(args, "--pad-ignore")
+            .map(parse_ignore)
+            .unwrap_or_default();
+        wait_for_press(&mut gilrs, seconds, &ignore)
+    };
+    flush_stdout();
+    Some(code)
+}
+
+/// Wait for the first button pressed on a pad not in `ignore`; `2` when none was pressed in time.
+fn wait_for_press(gilrs: &mut gilrs::Gilrs, seconds: u64, ignore: &[usize]) -> i32 {
+    let deadline = Instant::now() + Duration::from_secs(seconds);
+    while Instant::now() < deadline {
+        while let Some(gilrs::Event { id, event, .. }) = gilrs.next_event() {
+            if !matches!(event, gilrs::EventType::ButtonPressed(..)) {
+                continue;
+            }
+            let index = usize::from(id);
+            if ignore.contains(&index) {
+                continue;
+            }
+            let pad = gilrs.gamepad(id);
+            println!(
+                "{}",
+                json!({ "index": index, "name": pad.name(), "uuid": uuid_hex(pad.uuid()) })
+            );
+            return 0;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    println!("{}", json!({ "index": null }));
+    2
+}
+
 impl Pads {
     /// Open gilrs on first use. A platform without it (or a Linux without
     /// udev) leaves controllers off; the game runs as before.
@@ -262,23 +385,39 @@ impl Pads {
         }
         self.devices.started = true;
         // Once: a reader reopened after splitscreen keeps the pad it already took.
-        if self.devices.claims.is_none()
-            && let Some(dir) = std::env::var_os("HORIZON_PAD_CLAIMS").filter(|d| !d.is_empty())
-        {
-            let dir = PathBuf::from(dir);
-            match std::fs::create_dir_all(&dir) {
-                Ok(()) => {
-                    log::info!(
-                        "Pad claims in {}: this window takes the first pad pressed while it has focus",
-                        dir.display()
-                    );
-                    self.devices.claims = Some(Claims {
-                        dir,
-                        owned: None,
-                        file: None,
-                    });
-                }
-                Err(e) => log::warn!("Horizon: pad claims in {}: {e}", dir.display()),
+        if self.devices.claims.is_none() {
+            let fixed = std::env::var("HORIZON_PAD_INDEX")
+                .ok()
+                .and_then(|index| index.parse::<usize>().ok());
+            if let Some(index) = fixed {
+                log::info!("Pad fixed to index {index} (HORIZON_PAD_INDEX)");
+            }
+            let dir = std::env::var_os("HORIZON_PAD_CLAIMS")
+                .filter(|dir| !dir.is_empty())
+                .and_then(|dir| {
+                    let dir = PathBuf::from(dir);
+                    match std::fs::create_dir_all(&dir) {
+                        Ok(()) => {
+                            log::info!(
+                                "Pad claims in {}: this window takes the first pad pressed while it has focus",
+                                dir.display()
+                            );
+                            Some(dir)
+                        }
+                        Err(e) => {
+                            log::warn!("Horizon: pad claims in {}: {e}", dir.display());
+                            None
+                        }
+                    }
+                });
+            // A fixed index needs no claim files, and so no directory.
+            if fixed.is_some() || dir.is_some() {
+                self.devices.claims = Some(Claims {
+                    dir: dir.unwrap_or_default(),
+                    owned: None,
+                    file: None,
+                    fixed,
+                });
             }
         }
         self.devices.gilrs = match gilrs_builder().build() {
@@ -979,5 +1118,12 @@ mod claim_tests {
     fn a_claim_file_is_named_by_the_pads_index_and_uuid() {
         let uuid = [0xab; 16];
         assert_eq!(claim_key_of(3, uuid), format!("pad-3-{}", "ab".repeat(16)));
+    }
+
+    #[test]
+    fn pad_ignore_lists_the_indices_to_skip() {
+        assert_eq!(parse_ignore("0,2"), vec![0, 2]);
+        assert!(parse_ignore("").is_empty());
+        assert_eq!(parse_ignore("x,1"), vec![1]);
     }
 }

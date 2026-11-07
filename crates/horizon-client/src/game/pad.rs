@@ -94,6 +94,7 @@ struct Context {
 mod hardware;
 #[cfg(test)]
 mod parity_tests;
+pub(crate) use hardware::pad_tool;
 pub(super) use hardware::{PadId, PadRouter};
 
 /// How long the death screen's confirm ignores cancelling (`ConfirmScreen`).
@@ -133,6 +134,16 @@ mod hardware {
             PadState::default()
         }
         pub(in crate::game) fn release_hardware(&mut self) {}
+    }
+
+    /// The launch script's pad picker: this build has no hardware pads to list or wait on.
+    pub(crate) fn pad_tool(args: &[String]) -> Option<i32> {
+        let wanted = args.iter().any(|arg| arg == "--pad-list" || arg == "--pad-wait");
+        if !wanted {
+            return None;
+        }
+        println!("{}", json!({ "error": "no controller support" }));
+        Some(1)
     }
 
     pub(in crate::game) type PadId = usize;
