@@ -1,0 +1,32 @@
+name: pad build
+# Builds horizon-client.exe for Windows from this branch (pad claims for several games on one PC).
+on:
+  push:
+    branches: [pad-pinning]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  windows:
+    runs-on: windows-latest
+    timeout-minutes: 150
+    env:
+      RUSTFLAGS: -C target-feature=+crt-static
+      HORIZON_VERSION: nightly-2026-11-07-pad
+      HORIZON_NIGHTLY: 2026-11-07 6560641
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build the client
+        run: cargo build --release --locked -p horizon-client --bin horizon-client
+      - uses: actions/upload-artifact@v7
+        with:
+          name: horizon-client-windows-x64
+          path: target/release/horizon-client.exe
+          if-no-files-found: error
