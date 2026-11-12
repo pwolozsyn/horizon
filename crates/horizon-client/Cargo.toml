@@ -71,8 +71,10 @@ horizon-telemetry = { path = "../horizon-telemetry", default-features = false, f
 horizon-bench = { path = "../horizon-bench" }
 crc32fast = "1"
 zip = { version = "9.1.3", default-features = false, features = ["deflate"] }
-# Controllers (evdev + libudev on Linux, IOKit on macOS, Windows.Gaming.Input); the `controllers` feature.
-gilrs = { version = "0.11", optional = true }
+# Controllers (evdev + libudev on Linux, IOKit on macOS, XInput on Windows); the `controllers` feature.
+# XInput, not gilrs' default Windows.Gaming.Input: WGI only reports pads to the focused window, so
+# several game windows on one PC (one pad each) need XInput, which reads them in the background.
+gilrs = { version = "0.11", default-features = false, features = ["xinput"], optional = true }
 # The DualSense's rumble, adaptive triggers and lights over HID (gilrs only reads it).
 horizon-dualsense = { path = "../horizon-dualsense", optional = true }
 # HTTPS to the Minecraft services (online-mode session join).
