@@ -740,6 +740,52 @@ pub fn offline_skin() -> Option<&'static (Vec<u8>, bool)> {
     })
     .as_ref()
 }
+/// Offline names' skins from a shared folder (`HORIZON_SKINS_DIR`), keyed by
+/// each name's offline UUID: `<name>.png` is a classic skin, `<name>.slim.png`
+/// a slim one. Every game window on one PC reads the same folder, so each
+/// draws every player's own skin, not only its own. Read once.
+pub fn shared_offline_skins() -> &'static std::collections::HashMap<u128, (Vec<u8>, bool)> {
+    static SKINS: std::sync::OnceLock<std::collections::HashMap<u128, (Vec<u8>, bool)>> =
+        std::sync::OnceLock::new();
+    SKINS.get_or_init(|| {
+        let mut skins = std::collections::HashMap::new();
+        let Some(dir) = std::env::var_os("HORIZON_SKINS_DIR").filter(|d| !d.is_empty()) else {
+            return skins;
+        };
+        let entries = match std::fs::read_dir(&dir) {
+            Ok(entries) => entries,
+            Err(e) => {
+                eprintln!("Horizon: no skins folder ({}): {e}", std::path::Path::new(&dir).display());
+                return skins;
+            }
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let Some(file) = path.file_name().and_then(|f| f.to_str()) else {
+                continue;
+            };
+            if file.len() < 5 || !file[file.len() - 4..].eq_ignore_ascii_case(".png") {
+                continue;
+            }
+            let stem = &file[..file.len() - 4];
+            let (name, model) = match stem.strip_suffix(".slim") {
+                Some(name) => (name, "slim"),
+                None => (stem, "classic"),
+            };
+            if name.is_empty() {
+                continue;
+            }
+            match read_offline_skin(&path, model) {
+                Ok(skin) => {
+                    skins.insert(horizon_protocol::crypto::offline_uuid(name), skin);
+                }
+                Err(e) => eprintln!("Horizon: skin skipped ({}): {e}", path.display()),
+            }
+        }
+        skins
+    })
+}
+
 fn read_offline_skin(path: &std::path::Path, model: &str) -> Result<(Vec<u8>, bool), String> {
     let bytes = std::fs::read(path).map_err(|e| e.to_string())?;
     let (w, h, rgba) = crate::hud::decode_bytes(&bytes).map_err(|e| e.to_string())?;

@@ -5822,6 +5822,7 @@ impl Game<'_> {
             &r.skin_textures,
             &mut r.level_player_textures,
         );
+        let present: std::collections::HashSet<u128> = r.level_players.values().copied().collect();
         let own = match &r.own_profile {
             OwnProfile::Done(Some(t)) => Some(t.clone()),
             _ => None,
@@ -5882,6 +5883,22 @@ impl Game<'_> {
                 slim.insert(local);
             }
             resolved.push((local, OFFLINE.into()));
+        }
+        // Every offline name's skin from the shared folder (`HORIZON_SKINS_DIR`),
+        // for the players in the level that neither the server nor an account
+        // gives one: each window on one PC draws the others' skins too.
+        for (uuid, (rgba, is_slim)) in horizon_client::skins::shared_offline_skins() {
+            if (*uuid != local && !present.contains(uuid)) || resolved.iter().any(|(u, _)| u == uuid) {
+                continue;
+            }
+            let location = format!("horizon/offline_skin/{uuid:032x}");
+            if !self.skin_slots.contains(&location) || !self.gui.atlas.sprites.contains_key(&location) {
+                self.store_skin(location.clone(), rgba.clone());
+            }
+            if *is_slim {
+                slim.insert(*uuid);
+            }
+            resolved.push((*uuid, location));
         }
         // An offline name's cape from the launcher, where the profile has none.
         if !capes.contains_key(&local)
@@ -6090,7 +6107,7 @@ impl Game<'_> {
         uuid: u128,
         (skin, slim): (String, bool),
     ) -> (String, bool) {
-        if (skin.starts_with("skins/") || skin == "horizon/offline_skin") && !self.again_skin(&skin)
+        if (skin.starts_with("skins/") || skin.starts_with("horizon/offline_skin")) && !self.again_skin(&skin)
         {
             let skin = horizon_client::tab_list::default_skin(uuid);
             return (skin.to_owned(), skin.contains("/slim/"));
